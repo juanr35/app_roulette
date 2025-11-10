@@ -80,7 +80,6 @@ async function fetchRouletteData() {
   return data
 }
 
-
 // Función para procesar y almacenar los datos de roulette
 async function processRouletteData() {
   try {
