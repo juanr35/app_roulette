@@ -1,71 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import sql from '@/lib/db';
+import { createTables, logError } from '../actions';
 import { RouletteEventSchema } from './schemas';
 
-// Interfaces para los datos de la API de roulette
-/*
-interface RouletteOutcome {
-	number: number
-	type: string
-	color: string
-}
-
-interface RouletteTable {
-	id: string
-	name: string
-}
-
-interface RouletteData {
-	id: string
-	startedAt: Date
-	settledAt: Date
-	status: string
-	gameType: string
-	table: RouletteTable
-	result: {
-		outcome: RouletteOutcome
-		luckyNumbersList?: Array<{
-			number: number
-			roundedMultiplier: number
-		}>
-	}
-}
-
-interface RouletteEvent {
-	id: string
-	data: RouletteData
-}
-*/
-
 const RouletteEventsArraySchema = RouletteEventSchema.array();
-
-// Función para crear las tablas si no existen
-async function createTables() {
-  // Crear tabla casino
-  await sql`
-    CREATE TABLE IF NOT EXISTS casino (
-      id SERIAL PRIMARY KEY,
-      table_id TEXT UNIQUE NOT NULL,
-      table_name TEXT NOT NULL,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    )
-  `;
-
-  // Crear tabla roulette_events con foreign key a casino
-  await sql`
-    CREATE TABLE IF NOT EXISTS roulette_events (
-      id SERIAL PRIMARY KEY,
-      event_id TEXT UNIQUE NOT NULL,
-      started_at TIMESTAMP WITH TIME ZONE NOT NULL,
-      settled_at TIMESTAMP WITH TIME ZONE NOT NULL,
-      outcome_number INTEGER NOT NULL,
-      outcome_type TEXT NOT NULL,
-      outcome_color TEXT NOT NULL,
-      casino_id INTEGER REFERENCES casino(id),
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    )
-  `;
-}
 
 // Función para obtener datos de la API de roulette
 async function fetchRouletteData() {
@@ -91,22 +29,45 @@ async function processRouletteData() {
 
     const validatedFields = RouletteEventsArraySchema.parse(events);
 
-    // Obtener la fecha settled_at más reciente de la base de datos
-    const latestSettledResult = await sql`
-      SELECT MAX(settled_at) as latest_settled_at FROM roulette_events
-    `;
-    const latestSettledAt = latestSettledResult[0]?.latest_settled_at;
+    // Crear mapa de latest_settled_at por casino
+    const casinoLatestSettledMap = new Map<string, Date>();
 
-    // Filtrar eventos con status "Resolved" y settled_at más reciente que el último registro
+    // Obtener mesas únicas para consultar latest_settled_at por casino
+    const uniqueTableIds = new Set<string>();
+    validatedFields.forEach(event => {
+      uniqueTableIds.add(event.data.table.id);
+    });
+
+    // Consultar latest_settled_at para cada casino
+    const casinoQueries = Array.from(uniqueTableIds).map(async (tableId) => {
+      const result = await sql`
+        SELECT MAX(re.settled_at) as latest_settled_at
+        FROM roulette_events re
+        JOIN casino c ON re.casino_id = c.id
+        WHERE c.table_id = ${tableId}
+      `;
+
+      return { tableId, latestSettledAt: result[0]?.latest_settled_at };
+    });
+
+    const latestSettledResults = await Promise.all(casinoQueries);
+
+    latestSettledResults.forEach(({ tableId, latestSettledAt }) => {
+      if (latestSettledAt) {
+        casinoLatestSettledMap.set(tableId, new Date(latestSettledAt));
+      }
+    });
+
+    // Filtrar eventos con status "Resolved" y settled_at más reciente que el último registro por casino
     const resolvedEvents = validatedFields.filter(event => {
       if (event.data.status !== 'Resolved') return false;
 
-      if (!latestSettledAt) return true; // Si no hay registros previos, incluir todos
+      const latestSettledAt = casinoLatestSettledMap.get(event.data.table.id);
+
+      if (!latestSettledAt) return true; // Si no hay registros previos para este casino, incluir
 
       const eventSettledAt = new Date(event.data.settledAt);
-      const latestSettledDate = new Date(latestSettledAt);
-
-      return eventSettledAt > latestSettledDate;
+      return eventSettledAt > latestSettledAt;
     });
 
     if (resolvedEvents.length === 0) {
@@ -138,12 +99,12 @@ async function processRouletteData() {
       }
     });
 
-    // Obtener o crear casinos
-    for (const [tableId, tableName] of uniqueTables) {      
+    // Obtener o crear casinos en paralelo
+    const casinoPromises = Array.from(uniqueTables).map(async ([tableId, tableName]) => {
       // Buscar en la base de datos
       const casinoResult = await sql`
-        SELECT id 
-        FROM casino 
+        SELECT id
+        FROM casino
         WHERE table_id = ${tableId} AND table_name = ${tableName};
       `;
 
@@ -155,11 +116,16 @@ async function processRouletteData() {
           RETURNING id
         `;
 
-        casinoCache.set(tableId, insertResult[0].id);
+        return { tableId, casinoId: insertResult[0].id };
       } else {
-        casinoCache.set(tableId, casinoResult[0].id);
+        return { tableId, casinoId: casinoResult[0].id };
       }
-    }
+    });
+
+    const casinoResults = await Promise.all(casinoPromises);
+    casinoResults.forEach(({ tableId, casinoId }) => {
+      casinoCache.set(tableId, casinoId);
+    });
 
     // Preparar datos de eventos para inserción masiva
     resolvedEvents.forEach(event => {
@@ -194,6 +160,12 @@ async function processRouletteData() {
     return { processed: resolvedEvents.length };
   } catch (error) {
     console.error('Error procesando datos de roulette:', error);
+
+    // Registrar el error en la base de datos
+    if (error instanceof Error) {
+      await logError(error, 'processRouletteData');
+    }
+
     throw error;
   }
 }
