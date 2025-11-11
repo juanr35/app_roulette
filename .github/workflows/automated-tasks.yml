@@ -32,7 +32,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           echo "🚀 Iniciando procesamiento de datos de roulette..."
-          node scripts/process-roulette-data.js
+          npx tsx scripts/process-roulette-data.ts
           echo "✅ Procesamiento completado"
 
   cleanup-old-data:
@@ -58,5 +58,5 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           echo "🧹 Iniciando limpieza de registros antiguos..."
-          node scripts/cleanup-old-roulette-events.js
+          npx tsx scripts/cleanup-old-roulette-events.ts
           echo "✅ Limpieza completada"
