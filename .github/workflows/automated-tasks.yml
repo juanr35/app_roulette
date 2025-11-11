@@ -15,153 +15,25 @@ jobs:
     timeout-minutes: 3
 
     steps:
-      - name: Checkout minimal code
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            package.json
-            package-lock.json
-            app/api/scores/route.ts
-            app/api/scores/schemas.ts
-            lib/db.ts
-          sparse-checkout-cone-mode: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: package-lock.json
 
-      - name: Install production dependencies only
-        run: npm ci --omit=dev --ignore-scripts
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
 
-      - name: Create direct execution script
-        run: |
-          cat > run-process.js << 'EOF'
-          // Direct execution without Next.js overhead
-          const sql = require('./lib/db.ts').default;
-          const { RouletteEventSchema } = require('./app/api/scores/schemas.ts');
-
-          const RouletteEventsArraySchema = RouletteEventSchema.array();
-
-          async function createTables() {
-            await sql`CREATE TABLE IF NOT EXISTS casino (id SERIAL PRIMARY KEY, table_id TEXT UNIQUE NOT NULL, table_name TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())`;
-            await sql`CREATE TABLE IF NOT EXISTS roulette_events (id SERIAL PRIMARY KEY, event_id TEXT UNIQUE NOT NULL, started_at TIMESTAMP WITH TIME ZONE NOT NULL, settled_at TIMESTAMP WITH TIME ZONE NOT NULL, outcome_number INTEGER NOT NULL, outcome_type TEXT NOT NULL, outcome_color TEXT NOT NULL, casino_id INTEGER REFERENCES casino(id), created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())`;
-            await sql`CREATE TABLE IF NOT EXISTS error_logs (id SERIAL PRIMARY KEY, error_message TEXT NOT NULL, error_stack TEXT, context TEXT, created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())`;
-          }
-
-          async function fetchRouletteData() {
-            const response = await fetch('https://api.casinoscores.com/svc-evolution-game-events/api/megaroulette');
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-            const data = await response.json();
-            return RouletteEventsArraySchema.parse(data);
-          }
-
-          async function logError(error, context) {
-            try {
-              const errorMessage = error.message;
-              const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-              const recentError = await sql`SELECT id FROM error_logs WHERE error_message = ${errorMessage} AND created_at > ${twentyFourHoursAgo} LIMIT 1`;
-              if (recentError.length === 0) {
-                await sql`INSERT INTO error_logs (error_message, error_stack, context) VALUES (${errorMessage}, ${error.stack}, ${context || 'processRouletteData'})`;
-              }
-            } catch (logErr) {
-              console.error('Error logging:', logErr);
-            }
-          }
-
-          async function processRouletteData() {
-            try {
-              await createTables();
-              const events = await fetchRouletteData();
-
-              const resolvedEvents = events.filter(event => event.data.status === 'Resolved');
-              if (resolvedEvents.length === 0) return { processed: 0 };
-
-              // Get latest settled_at per casino
-              const uniqueTableIds = new Set(resolvedEvents.map(e => e.data.table.id));
-              const latestSettledResults = await Promise.all(
-                Array.from(uniqueTableIds).map(tableId =>
-                  sql`SELECT MAX(re.settled_at) as latest_settled_at FROM roulette_events re JOIN casino c ON re.casino_id = c.id WHERE c.table_id = ${tableId}`
-                )
-              );
-
-              const casinoLatestSettledMap = new Map();
-              latestSettledResults.forEach((result, index) => {
-                const tableId = Array.from(uniqueTableIds)[index];
-                if (result[0]?.latest_settled_at) {
-                  casinoLatestSettledMap.set(tableId, new Date(result[0].latest_settled_at));
-                }
-              });
-
-              // Filter events
-              const filteredEvents = resolvedEvents.filter(event => {
-                const tableId = event.data.table.id;
-                const latestSettledAt = casinoLatestSettledMap.get(tableId);
-                if (!latestSettledAt) return true;
-                return new Date(event.data.settledAt) > latestSettledAt;
-              });
-
-              if (filteredEvents.length === 0) return { processed: 0 };
-
-              // Process casinos in parallel
-              const uniqueTables = new Map();
-              filteredEvents.forEach(event => {
-                const { id, name } = event.data.table;
-                if (!uniqueTables.has(id)) uniqueTables.set(id, name);
-              });
-
-              const casinoPromises = Array.from(uniqueTables).map(async ([tableId, tableName]) => {
-                const result = await sql`SELECT id FROM casino WHERE table_id = ${tableId} AND table_name = ${tableName}`;
-                if (result.length === 0) {
-                  const insertResult = await sql`INSERT INTO casino (table_id, table_name) VALUES (${tableId}, ${tableName}) RETURNING id`;
-                  return { tableId, casinoId: insertResult[0].id };
-                }
-                return { tableId, casinoId: result[0].id };
-              });
-
-              const casinoResults = await Promise.all(casinoPromises);
-              const casinoCache = new Map(casinoResults.map(({ tableId, casinoId }) => [tableId, casinoId]));
-
-              // Prepare and insert events
-              const eventData = filteredEvents.map(event => ({
-                event_id: event.data.id,
-                started_at: event.data.startedAt,
-                settled_at: event.data.settledAt,
-                outcome_number: event.data.result.outcome.number,
-                outcome_type: event.data.result.outcome.type,
-                outcome_color: event.data.result.outcome.color,
-                casino_id: casinoCache.get(event.data.table.id)
-              }));
-
-              await sql`INSERT INTO roulette_events ${sql(eventData, 'event_id', 'started_at', 'settled_at', 'outcome_number', 'outcome_type', 'outcome_color', 'casino_id')} ON CONFLICT (event_id) DO NOTHING`;
-
-              return { processed: filteredEvents.length };
-            } catch (error) {
-              await logError(error, 'processRouletteData');
-              throw error;
-            }
-          }
-
-          async function main() {
-            try {
-              const result = await processRouletteData();
-              console.log('Success:', JSON.stringify(result));
-              process.exit(0);
-            } catch (error) {
-              console.error('Error:', error.message);
-              process.exit(1);
-            }
-          }
-
-          main();
-          EOF
-
-      - name: Execute data processing
-        run: node run-process.js
+      - name: Process roulette data
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "🚀 Iniciando procesamiento de datos de roulette..."
+          node scripts/process-roulette-data.js
+          echo "✅ Procesamiento completado"
 
   cleanup-old-data:
     if: github.event.schedule == '0 2 * * 0' || github.event_name == 'workflow_dispatch'
@@ -169,71 +41,22 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Checkout minimal code
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            package.json
-            package-lock.json
-            app/api/cleaner/route.ts
-            lib/db.ts
-          sparse-checkout-cone-mode: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: package-lock.json
 
-      - name: Install production dependencies only
-        run: npm ci --omit=dev --ignore-scripts
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
 
-      - name: Create direct execution script
-        run: |
-          cat > run-cleanup.js << 'EOF'
-          const sql = require('./lib/db.ts').default;
-
-          async function logError(error, context) {
-            try {
-              const errorMessage = error.message;
-              const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-              const recentError = await sql`SELECT id FROM error_logs WHERE error_message = ${errorMessage} AND created_at > ${twentyFourHoursAgo} LIMIT 1`;
-              if (recentError.length === 0) {
-                await sql`INSERT INTO error_logs (error_message, error_stack, context) VALUES (${errorMessage}, ${error.stack}, ${context || 'cleanupOldRouletteEvents'})`;
-              }
-            } catch (logErr) {
-              console.error('Error logging:', logErr);
-            }
-          }
-
-          async function cleanupOldRouletteEvents() {
-            try {
-              const threeMonthsAgo = new Date();
-              threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
-              const result = await sql`DELETE FROM roulette_events WHERE created_at < ${threeMonthsAgo}`;
-              return { deleted: result.length };
-            } catch (error) {
-              await logError(error, 'cleanupOldRouletteEvents');
-              throw error;
-            }
-          }
-
-          async function main() {
-            try {
-              const result = await cleanupOldRouletteEvents();
-              console.log('Cleanup completed:', JSON.stringify(result));
-              process.exit(0);
-            } catch (error) {
-              console.error('Error:', error.message);
-              process.exit(1);
-            }
-          }
-
-          main();
-          EOF
-
-      - name: Execute cleanup
-        run: node run-cleanup.js
+      - name: Cleanup old roulette events
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "🧹 Iniciando limpieza de registros antiguos..."
+          node scripts/cleanup-old-roulette-events.js
+          echo "✅ Limpieza completada"
