@@ -60,6 +60,9 @@ jobs:
 
       - name: Build application
         run: npm run build
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
 
       - name: Start application and cleanup data
         run: |
