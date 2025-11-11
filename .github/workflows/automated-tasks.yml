@@ -1,0 +1,68 @@
+name: Automated Roulette Tasks
+
+on:
+  schedule:
+    # Ejecutar processRouletteData cada 10 minutos
+    - cron: '*/10 * * * *'
+    # Ejecutar cleanupOldRouletteEvents cada domingo a las 2:00 AM UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch: # Permitir ejecución manual
+
+jobs:
+  process-roulette-data:
+    if: github.event.schedule == '*/10 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Start application and process data
+        run: |
+          npm start &
+          sleep 10
+          curl -f http://localhost:3000/api/scores || exit 1
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
+
+  cleanup-old-data:
+    if: github.event.schedule == '0 2 * * 0' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Start application and cleanup data
+        run: |
+          npm start &
+          sleep 10
+          curl -f http://localhost:3000/api/cleaner || exit 1
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NODE_ENV: production
