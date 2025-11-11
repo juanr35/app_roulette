@@ -1,0 +1,33 @@
+name: Cleaner Task
+
+on:
+  schedule:
+    # Ejecutar cleanupOldRouletteEvents cada domingo a las 2:00 AM UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch: # Permitir ejecución manual
+
+jobs:
+  cleanup-old-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Cleanup old roulette events
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "🧹 Iniciando limpieza de registros antiguos..."
+          npx tsx scripts/cleanup-old-roulette-events.ts
+          echo "✅ Limpieza completada"
